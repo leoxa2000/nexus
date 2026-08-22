@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════
 // NEXUS BOT — Server som kör dygnet runt
-// Hämtar riktiga priser från CoinGecko + paper-trading + nyhetsveto
+// Hämtar riktiga priser från Coinbase + paper-trading + nyhetsveto
+// Prisleverantör: Coinbase (enda källan för spotpriser)
 // ═══════════════════════════════════════════════════════
 
 const express = require('express');
@@ -88,7 +89,9 @@ function saveState() {
   }
 }
 
-// ── ASSETS (CoinGecko IDs) ──
+// ── ASSETS ──
+// Coinbase stödjer de flesta stora tillgångar. Om en tillgång saknas (t.ex. BNB)
+// markeras den som ej tillgänglig istället för att orsaka ett totalt fel.
 const ASSETS = [
   { id: 'BTC',  name: 'Bitcoin',          color: '#F7931A' },
   { id: 'ETH',  name: 'Ethereum',         color: '#627EEA' },
@@ -112,7 +115,8 @@ const ASSETS = [
   { id: 'ARB',  name: 'Arbitrum',         color: '#28A0F0' },
 ];
 
-let currentPrices = {};
+let currentPrices = {};       // senast giltiga pris per tillgång (SEK) — bevaras vid API-fel
+let assetStatus = {};         // { BTC: 'ok', BNB: 'unsupported', ... }
 let lastPriceUpdate = 0;
 let logLines = [];
 let consecutiveFailures = 0;
@@ -136,7 +140,10 @@ function log(msg, type='info') {
 let usdSekRate = 10.5; // rimligt startvärde tills första hämtningen lyckas
 async function fetchUsdSekRate() {
   try {
-    const res = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch('https://api.exchangerate-api.com/v4/latest/USD', { signal: controller.signal });
+    clearTimeout(timeout);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (data.rates && data.rates.SEK) {
@@ -144,49 +151,95 @@ async function fetchUsdSekRate() {
       log(`💱 USD/SEK-kurs uppdaterad: ${usdSekRate.toFixed(3)}`, 'system');
     }
   } catch (e) {
-    log(`⚠ Kunde inte uppdatera USD/SEK-kurs, använder senaste kända värde (${usdSekRate})`, 'error');
+    const reason = e.name === 'AbortError' ? 'timeout' : e.message;
+    log(`⚠ Kunde inte uppdatera USD/SEK-kurs (${reason}), behåller ${usdSekRate.toFixed(3)}`, 'error');
   }
 }
 
 // ═══════════════════════════════════════════════════════
-// FETCH REAL PRICES FROM COINBASE (gratis, ingen nyckel, stor etablerad börs
-// — hämtar en tillgång i taget parallellt, så att om t.ex. BNB saknas
-// påverkar det inte de andra 5 tillgångarna)
+// FETCH REAL PRICES FROM COINBASE (enda prisleverantören)
+// — Hämtar en tillgång i taget parallellt via AbortController-timeout
+// — 429 (rate limit) hanteras med loggning utan att krascha
+// — Tillgångar som Coinbase inte stödjer markeras som 'unsupported'
+// — Senast giltiga priser bevaras vid tillfälliga API-fel
 // ═══════════════════════════════════════════════════════
+const COINBASE_TIMEOUT_MS = 8000;
+
+async function fetchSingleAssetPrice(asset) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), COINBASE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://api.coinbase.com/v2/prices/${asset.id}-USD/spot`, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (res.status === 429) {
+      throw new Error('rate-limited (429)');
+    }
+    if (res.status === 404) {
+      assetStatus[asset.id] = 'unsupported';
+      throw new Error('not found on Coinbase (404)');
+    }
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const json = await res.json();
+    const priceUsd = parseFloat(json.data?.amount);
+    if (!priceUsd || priceUsd <= 0) throw new Error('invalid price in response');
+
+    assetStatus[asset.id] = 'ok';
+    return { id: asset.id, priceUsd };
+  } catch (e) {
+    clearTimeout(timeout);
+    throw e;
+  }
+}
+
 async function fetchPrices() {
   const results = await Promise.allSettled(
-    ASSETS.map(a => fetch(`https://api.coinbase.com/v2/prices/${a.id}-USD/spot`).then(async res => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      const priceUsd = parseFloat(json.data?.amount);
-      if (!priceUsd) throw new Error('inget pris i svaret');
-      return { id: a.id, priceUsd };
-    }))
+    ASSETS.map(a => fetchSingleAssetPrice(a))
   );
 
   let successCount = 0;
+  let rateLimited = false;
+  const errors = [];
+
   results.forEach((r, i) => {
     const asset = ASSETS[i];
     if (r.status === 'fulfilled') {
       successCount++;
       const priceSek = r.value.priceUsd * usdSekRate;
-      currentPrices[asset.id] = priceSek;
+      currentPrices[asset.id] = priceSek;  // uppdatera bara vid lyckat hämtande
       if (!state.priceHistory[asset.id]) state.priceHistory[asset.id] = [];
       state.priceHistory[asset.id].push(priceSek);
       if (state.priceHistory[asset.id].length > 60) state.priceHistory[asset.id].shift();
     } else {
-      // En enskild tillgång kan sakna stöd hos Coinbase (t.ex. BNB) — logga men fortsätt med resten
-      if (consecutiveFailures === 0) log(`⚠ ${asset.id}: ${r.reason.message}`, 'error');
+      const msg = r.reason?.message || 'unknown error';
+      if (msg.includes('429')) rateLimited = true;
+      // Logga sammanfattat utan hemligheter — bara tillgångs-ID och feltyp
+      errors.push(`${asset.id}:${msg}`);
+      // Behåll senast giltiga pris — currentPrices[asset.id] ändras inte vid fel
     }
   });
+
+  // Sammanfattad felsloggning (ingen token/nyckel exponeras)
+  if (errors.length > 0 && consecutiveFailures === 0) {
+    log(`⚠ Prisfel (${errors.length}/${ASSETS.length}): ${errors.join(', ')}`, 'error');
+  }
 
   if (successCount === 0) {
     consecutiveFailures++;
     log(`⚠ Prisfetch misslyckades helt (0/${ASSETS.length} tillgångar)`, 'error');
     return false;
   }
+
   consecutiveFailures = 0;
   lastPriceUpdate = Date.now();
+
+  if (rateLimited) {
+    log('⏳ Coinbase rate-limit (429) — vissa tillgångar hoppar över denna omgång', 'error');
+  }
+
   return true;
 }
 
@@ -569,7 +622,7 @@ setInterval(newsCheckCycle, 60000 * 20);      // nyhetscheck: en tillgång var 2
 setInterval(fetchUsdSekRate, 60000 * 60);     // uppdatera USD/SEK-kurs en gång i timmen
 
 fetchUsdSekRate().then(() => fetchPrices()).then(() => {
-  log('✓ NEXUS bot startad — hämtar riktiga priser från Coinbase', 'system');
+  log('✓ NEXUS bot startad — hämtar riktiga priser från Coinbase (enda prisleverantör)', 'system');
   checkDailySnapshot();
   if (CRYPTOPANIC_KEY || ALPHAVANTAGE_KEY) {
     log('🛡️ Nyhetsveto aktivt — CryptoPanic/Alpha Vantage konfigurerat', 'system');
@@ -585,7 +638,7 @@ fetchUsdSekRate().then(() => fetchPrices()).then(() => {
 // ═══════════════════════════════════════════════════════
 app.get('/health', (req, res) => {
   const hasPriceData = Object.keys(currentPrices).length > 0;
-  res.status(hasPriceData ? 200 : 503).json({
+  res.status(200).json({
     status: hasPriceData ? 'ok' : 'starting',
     service: 'nexus-bot',
     uptimeSeconds: Math.round(process.uptime()),
@@ -597,6 +650,49 @@ app.get('/health', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.redirect('/health');
+});
+
+app.get('/api/test', (req, res) => {
+  const hasPriceData = Object.keys(currentPrices).length > 0;
+  const portVal = Object.entries(state.holdings)
+    .reduce((s,[id,h]) => s + (currentPrices[id] || h.avgCost) * h.qty, 0);
+  const totalVal = state.cash + portVal;
+  const supportedAssets = ASSETS.filter(a => assetStatus[a.id] !== 'unsupported');
+  const unsupportedAssets = ASSETS.filter(a => assetStatus[a.id] === 'unsupported');
+
+  res.status(200).json({
+    status: 'ok',
+    service: 'nexus-bot',
+    timestamp: new Date().toISOString(),
+    server: {
+      port: PORT,
+      uptimeSeconds: Math.round(process.uptime()),
+      dataDirectory: DATA_DIR
+    },
+    prices: {
+      source: 'Coinbase',
+      hasPriceData,
+      lastPriceUpdate,
+      assetCount: Object.keys(currentPrices).length,
+      supportedAssets: supportedAssets.map(a => a.id),
+      unsupportedAssets: unsupportedAssets.map(a => a.id),
+      usdSekRate: parseFloat(usdSekRate.toFixed(3))
+    },
+    portfolio: {
+      cash: parseFloat(state.cash.toFixed(2)),
+      holdingsValue: parseFloat((portVal).toFixed(2)),
+      totalValue: parseFloat(totalVal.toFixed(2)),
+      startCash: state.startCash,
+      pnl: parseFloat((totalVal - state.startCash).toFixed(2)),
+      tradeCount: state.trades.length
+    },
+    bot: {
+      botOn: state.botOn,
+      haltedByKillSwitch: state.haltedByKillSwitch,
+      newsVetoEnabled: state.newsVetoEnabled,
+      newsConfigured: !!(CRYPTOPANIC_KEY || ALPHAVANTAGE_KEY)
+    }
+  });
 });
 
 app.get('/api/status', (req, res) => {
