@@ -19,14 +19,17 @@ async function main() {
   for (let attempt = 0; attempt < 30; attempt++) {
     try {
       const health = await request('/health');
-      if (![200, 503].includes(health.status)) throw new Error(`health ${health.status}`);
+      if (health.status !== 200) throw new Error(`health ${health.status}`);
+      const test = await request('/api/test');
+      if (test.status !== 200) throw new Error(`test ${test.status}`);
       const status = await request('/api/status');
       if (status.status !== 200) throw new Error(`status ${status.status}`);
       const root = await request('/');
       if (root.status !== 200 || !root.body.includes('NEXUS')) throw new Error(`root ${root.status}`);
       JSON.parse(health.body);
+      JSON.parse(test.body);
       JSON.parse(status.body);
-      console.log(`Smoke test passed: /health ${health.status}, /api/status 200, / 200`);
+      console.log(`Smoke test passed: /health 200, /api/test 200, /api/status 200, / 200`);
       return;
     } catch (error) {
       lastError = error;
